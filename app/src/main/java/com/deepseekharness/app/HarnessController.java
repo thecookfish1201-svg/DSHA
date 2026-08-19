@@ -2198,6 +2198,9 @@ public class HarnessController {
         if (fresh != null) return fresh;
         String[] urls = {
                 gitHubProxy("https://raw.githubusercontent.com/AdamPlatin123/awesome-dsh-plugins/main/PLUGINS-ALL.md"),
+                // raw/jsDelivr 在部分国内网络会被 TLS/SNI 阻断；GitHub Contents API 可直接返回原文，
+                // 作为独立链路兜底（Accept 头在下方统一设置）。
+                "https://api.github.com/repos/AdamPlatin123/awesome-dsh-plugins/contents/PLUGINS-ALL.md?ref=main",
                 "https://cdn.jsdelivr.net/gh/AdamPlatin123/awesome-dsh-plugins@main/PLUGINS-ALL.md",
                 "https://cdn.jsdelivr.net/gh/AdamPlatin123/awesome-dsh-plugins@master/PLUGINS-ALL.md",
                 "https://gcore.jsdelivr.net/gh/AdamPlatin123/awesome-dsh-plugins@main/PLUGINS-ALL.md",
@@ -2214,6 +2217,8 @@ public class HarnessController {
                 conn.setConnectTimeout(6000);
                 conn.setReadTimeout(20000);
                 conn.setRequestProperty("User-Agent", "DSHA/" + getVersionName());
+                conn.setRequestProperty("Accept", "application/vnd.github.raw+json");
+                conn.setRequestProperty("X-GitHub-Api-Version", "2022-11-28");
                 if (conn.getResponseCode() != 200) {
                     conn.disconnect();
                     continue;
@@ -2227,9 +2232,9 @@ public class HarnessController {
                 }
                 conn.disconnect();
                 String j = sb.toString();
-                // 全量列表包含分类折叠；README 兜底含旧表格。两种都够格解析
-                boolean ok = j.indexOf("<summary>") >= 0 && j.indexOf("<b>") >= 0
-                        && (j.indexOf("[") >= 0) && j.length() > 8000;
+                // 不再用旧版 <details><summary><b> 标记判断有效性：上游已改成普通的
+                // “## 分类”标题。直接以实际可解析条目为准，兼容新旧两种格式。
+                boolean ok = j.length() > 1000 && parseMarketTable(j).size() >= 10;
                 if (ok) {
                     writeMarketCache(j); // 拉成功即缓存，网络抽风时也能秒开
                     return j;
@@ -2296,20 +2301,17 @@ public class HarnessController {
         String category = "";
         for (String raw : md.split("\n")) {
             String t = raw.trim();
-            // ===== 分类：<summary><b>🎓 技能包（2）</b></summary> =====
+            // ===== 分类（兼容两代上游格式） =====
+            // 旧：<summary><b>🎓 技能包（2）</b></summary>
+            // 新：## 🎓 技能包（20）
             int b1 = t.indexOf("<b>");
             if (b1 >= 0) {
                 int b2 = t.indexOf("</b>", b1);
-                if (b2 > b1) {
-                    String c = t.substring(b1 + 3, b2).trim();
-                    c = c.replaceAll("（\\s*\\d+\\s*）$", "").replaceAll("\\(\\s*\\d+\\s*\\)$", "").trim();
-                    int k = 0;
-                    while (k < c.length()) {
-                        int cp = c.codePointAt(k);
-                        if (cp > 0x2E80) k += Character.charCount(cp); else break;
-                    }
-                    category = c.substring(k).trim();
-                }
+                if (b2 > b1) category = cleanMarketCategory(t.substring(b1 + 3, b2));
+                continue;
+            }
+            if (t.startsWith("## ") && t.matches(".*[（(]\\s*\\d+\\s*[）)]$")) {
+                category = cleanMarketCategory(t.substring(3));
                 continue;
             }
             // ===== 条目：列表式  - `[可用]` [name](url) ★12 — desc =====
@@ -2325,15 +2327,13 @@ public class HarnessController {
                 String url = t.substring(u1 + 1, u2).trim();
                 if (!url.startsWith("http")) continue;
                 String rest = t.substring(u2 + 1);
-                // ★star
+                // star：旧格式为“★12”，新格式为链接后的裸数字“12”
                 String star = "0";
                 int st = rest.indexOf("★");
-                if (st >= 0) {
-                    String sx = rest.substring(st + 1).trim();
-                    int d = 0;
-                    while (d < sx.length() && Character.isDigit(sx.charAt(d))) d++;
-                    if (d > 0) star = sx.substring(0, d);
-                }
+                String sx = (st >= 0 ? rest.substring(st + 1) : rest).trim();
+                int d = 0;
+                while (d < sx.length() && Character.isDigit(sx.charAt(d))) d++;
+                if (d > 0) star = sx.substring(0, d);
                 String desc = "";
                 int dash = rest.indexOf("—");
                 if (dash >= 0) desc = rest.substring(dash + 1).trim();
@@ -2341,9 +2341,7 @@ public class HarnessController {
                 String uu = url.replace("https://github.com/", "").replace("http://github.com/", "");
                 int slash = uu.indexOf('/');
                 if (slash > 0) owner = uu.substring(0, slash);
-                compat = compat.replace("可用", "✅可用").replace("不兼容", "❌不兼容")
-                        .replace("待定", "⏳待定").replace("未测", "⏳未测");
-                if (compat.length() > 8) compat = compat.substring(0, 8);
+                compat = normalizeMarketCompat(compat);
                 out.add(new String[]{name, star, owner, compat, category, desc, url});
                 continue;
             }
@@ -2365,14 +2363,35 @@ public class HarnessController {
                 String uu = url.replace("https://github.com/", "").replace("http://github.com/", "");
                 int slash = uu.indexOf('/');
                 if (slash > 0) owner = uu.substring(0, slash);
-                compat = compat.replace("✅ 运行级可用", "✅可用").replace("⏳ 未测", "⏳未测")
-                        .replace("❌ 运行级不兼容", "❌不兼容").replace("✅", "✅可用");
-                if (compat.isEmpty() || compat.equals("插件") || compat.equals("合集")) compat = "⏳未测";
-                if (compat.length() > 8) compat = compat.substring(0, 8);
+                if (compat.isEmpty() || compat.equals("插件") || compat.equals("合集")) compat = "未测";
+                compat = normalizeMarketCompat(compat);
                 out.add(new String[]{name, "0", owner, compat, category, desc, url});
             }
         }
         return out;
+    }
+
+    /** 清理分类标题中的数量和前导 emoji；不能按码点范围删除，否则会把中文分类名一起删掉。 */
+    private static String cleanMarketCategory(String value) {
+        String c = value == null ? "" : value.trim();
+        c = c.replaceAll("（\\s*\\d+\\s*）$", "")
+                .replaceAll("\\(\\s*\\d+\\s*\\)$", "").trim();
+        int start = 0;
+        while (start < c.length()) {
+            int cp = c.codePointAt(start);
+            if (Character.isLetterOrDigit(cp)) break;
+            start += Character.charCount(cp);
+        }
+        return c.substring(start).trim();
+    }
+
+    /** 把上游的四档判定统一成 App 展示文本，避免“可用”替换污染“不兼容”。 */
+    private static String normalizeMarketCompat(String value) {
+        String v = value == null ? "" : value.trim();
+        if (v.contains("不兼容") || v.contains("需适配")) return "❌不兼容";
+        if (v.contains("可用")) return "✅可用";
+        if (v.contains("待定")) return "⏳待定";
+        return "⏳未测";
     }
 
     /** 拉取单个仓库详情（最近更新/star/作者），GitHub API 单查 + 内存缓存 */
